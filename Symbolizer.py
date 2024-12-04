@@ -9,9 +9,7 @@ import os
 from pathlib import Path
 from tqdm import tqdm
 import logging
-from functools import lru_cache
 
-# Enhanced logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -57,6 +55,9 @@ class Symbolizer:
         self._word_pattern = re.compile(r'\S+')
         self._repeating_char_pattern = re.compile(r'(.)\1+')
         
+        # Initialize trie for faster token matching
+        self.trie = {}
+        
         self._initialize_special_tokens()
 
     def _initialize_special_tokens(self):
@@ -72,6 +73,50 @@ class Symbolizer:
             self.vocabulary[token] = idx
             self.reverse_vocab[idx] = token
             self.frequencies[token] = float('inf')
+
+    def _build_trie(self):
+        """Build trie structure for efficient token matching"""
+        self.trie = {}
+        for token in self.vocabulary:
+            current = self.trie
+            for char in token:
+                if char not in current:
+                    current[char] = {}
+                current = current[char]
+            current['$'] = token  # Mark end of token
+
+    def _find_longest_token(self, text: str, start: int, dp_cache: Dict[int, Tuple[int, str]]) -> Tuple[int, str]:
+        """
+        Find longest matching token starting at given position using dynamic programming
+        
+        Args:
+            text: Input text
+            start: Starting position
+            dp_cache: Dynamic programming cache
+            
+        Returns:
+            Tuple of (token length, token)
+        """
+        if start in dp_cache:
+            return dp_cache[start]
+
+        if start >= len(text):
+            return (0, self.UNKNOWN_TOKEN)
+
+        current = self.trie
+        longest_match = (1, self.UNKNOWN_TOKEN)
+        
+        for i in range(start, min(start + self.max_subword_length, len(text))):
+            char = text[i]
+            if char not in current:
+                break
+            current = current[char]
+            if '$' in current:  # Found a complete token
+                token = current['$']
+                longest_match = (len(token), token)
+
+        dp_cache[start] = longest_match
+        return longest_match
 
     def _find_text_files(self, root_dir: str) -> Generator[Path, None, None]:
         """
@@ -110,14 +155,18 @@ class Symbolizer:
             for match in re.finditer(r'(.)\1+', chunk):
                 local_counter[match.group(0)] += 1
                 
-            # Count subwords
+            # Count subwords with DP
             words = re.findall(r'\S+', chunk)
             for word in words:
                 n = len(word)
+                dp = {}  # Cache for subword counts
                 for length in range(2, min(n + 1, max_length + 1)):
                     for i in range(n - length + 1):
+                        if i in dp and dp[i][0] >= length:
+                            continue
                         subword = word[i:i+length]
                         local_counter[subword] += 1
+                        dp[i] = (length, subword)
                         
             return local_counter, chunk_size
         except Exception as e:
@@ -143,7 +192,6 @@ class Symbolizer:
                         chunks.append((chunk, self.max_subword_length, file_path))
                     mm.close()
                 except Exception as e:
-                    # Fallback to normal reading if memory mapping fails
                     logger.warning(f"Memory mapping failed for {file_path}, falling back to normal reading")
                     f.seek(0)
                     content = f.read()
@@ -208,6 +256,9 @@ class Symbolizer:
             self.frequencies[symbol] = count
             current_idx += 1
             
+        # Build trie for efficient token matching
+        self._build_trie()
+            
         logger.info(f"Final vocabulary size: {len(self.vocabulary)}")
 
     def encode_file(self, file_path: str) -> np.ndarray:
@@ -233,25 +284,16 @@ class Symbolizer:
             return np.array([], dtype=np.int32)
 
     def encode(self, text: str) -> np.ndarray:
-        """Encode text to sequence of indices"""
+        """Encode text to sequence of indices using dynamic programming"""
         tokens = []
+        dp_cache = {}  # Cache for dynamic programming
         i = 0
         text_len = len(text)
         
         while i < text_len:
-            best_length = 1
-            best_token = self.UNKNOWN_TOKEN
-            
-            # Try to match longest possible symbol
-            for length in range(min(self.max_subword_length, text_len - i), 0, -1):
-                substring = text[i:i+length]
-                if substring in self.vocabulary:
-                    best_length = length
-                    best_token = substring
-                    break
-            
-            tokens.append(self.vocabulary[best_token])
-            i += best_length
+            length, token = self._find_longest_token(text, i, dp_cache)
+            tokens.append(self.vocabulary[token])
+            i += length
             
         return np.array(tokens, dtype=np.int32)
 
@@ -315,6 +357,9 @@ class Symbolizer:
         self.max_subword_length = config['max_subword_length']
         self.file_extensions = set(config.get('file_extensions', 
             {'.txt', '.md', '.py', '.java', '.cpp', '.h', '.c', '.js', '.html', '.css'}))
+        
+        # Rebuild trie after loading vocabulary
+        self._build_trie()
 
 if __name__ == "__main__":
     symbolizer = Symbolizer(
